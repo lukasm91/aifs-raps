@@ -1,0 +1,122 @@
+# AIFS-RAPS Direct Container
+
+This folder builds one self-contained AIFS-RAPS benchmark image. The image
+contains the Python environment, Anemoi packages, configs, grids, and generated
+dummy Zarr datasets under `/data`.
+
+Users do not need this repo to run the image. They need the image reference, a
+writable mount for `/work` to retain outputs, and a writable mount for `/graphs`
+to retain generated graph files.
+
+## Build
+
+```bash
+IMAGE=...
+
+docker build \
+  --build-arg BASE_IMAGE=nvcr.io/nvidia/pyg:26.01-py3 \
+  --build-arg ANEMOI_BRANCH=aifs-raps_20251215 \
+  -t "$IMAGE" .
+```
+
+Push `$IMAGE` to GitLab or another registry that Enroot/Pyxis can pull.
+
+## Run
+
+The image provides one command:
+
+```bash
+aifs-benchmark throughput
+aifs-benchmark highres
+aifs-benchmark throughput-generate-graph
+aifs-benchmark highres-generate-graph
+aifs-benchmark correctness
+aifs-benchmark smoke
+```
+
+Example SLURM usage without any launcher checkout:
+
+```bash
+srun \
+  -N 1 \
+  -n 4 \
+  --mpi=pmix \
+  --container-image=<image-ref> \
+  --container-mounts "$PWD:/work,$PWD/graphs:/graphs" \
+  --container-workdir=/work \
+  aifs-benchmark throughput
+```
+
+Runtime overrides are environment variables, for example:
+
+```bash
+batch_limit=45 max_epochs=2 num_workers=2 run_prefix=test \
+srun ... aifs-benchmark throughput
+```
+
+The benchmark commands expect a SLURM allocation and derive node count from
+`SLURM_NNODES`. Each node is assumed to have four GPUs.
+
+Generate each graph once, then reuse it for normal runs:
+
+```bash
+mkdir -p graphs
+srun ... aifs-benchmark throughput-generate-graph
+srun ... aifs-benchmark throughput
+```
+
+Both commands use `/graphs` inside the container.
+
+The correctness benchmark uses the real O48 dataset rather than a generated
+dummy dataset. Mount the dataset parent at `/data/correctness`:
+
+```bash
+srun \
+  -N 1 \
+  -n 4 \
+  --mpi=pmix \
+  --container-image=<image-ref> \
+  --container-mounts "$PWD:/work,$PWD/graphs:/graphs,/path/to/dataset-parent:/data/correctness:ro" \
+  --container-workdir=/work \
+  aifs-benchmark correctness
+```
+
+By default it expects:
+
+```text
+/data/correctness/aifs-ea-an-oper-0001-mars-o48-1979-2022-6h-v6.zarr
+```
+
+If the mounted dataset has another name, set `correctness_dataset` to the
+directory name inside `/data/correctness`.
+
+The thin `*.slurm` files one directory up are examples for Lyris allocations:
+
+```bash
+cd ..
+sbatch throughput.slurm
+sbatch high-res.slurm
+sbatch --export=ALL,correctness_data_host=/path/to/dataset.zarr correctness.slurm
+```
+
+## Editable `anemoi-core`
+
+Mount a local checkout at `/opt/anemoi-core`:
+
+```bash
+srun \
+  --container-image=<image-ref> \
+  --container-mounts "$PWD:/work,$PWD/graphs:/graphs,/path/to/anemoi-core:/opt/anemoi-core" \
+  --container-workdir=/work \
+  aifs-benchmark throughput
+```
+
+`aifs-benchmark` detects component `src` directories under the mounted checkout
+and prepends them to `PYTHONPATH`, so code changes can be tested without
+rebuilding the image.
+
+The SLURM wrappers expose the same mount as `anemoi_core_host`:
+
+```bash
+sbatch --export=ALL,anemoi_core_host=/path/to/anemoi-core throughput.slurm
+```

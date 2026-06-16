@@ -1,0 +1,628 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  aifs-benchmark throughput [--profile] [hydra overrides...]
+  aifs-benchmark highres [hydra overrides...]
+  aifs-benchmark throughput-generate-graph [hydra overrides...]
+  aifs-benchmark highres-generate-graph [hydra overrides...]
+  aifs-benchmark correctness [hydra overrides...]
+  aifs-benchmark smoke
+
+Environment overrides:
+  batch_limit, max_epochs, num_workers, run_prefix
+  profile=1 to run anemoi-training profile for throughput
+  ens_size, local_bs
+  correctness_dataset, correctness_batch_limit
+  ANEMOI_CORE_EDITABLE
+
+Mount an editable anemoi-core checkout at /opt/anemoi-core, or set
+ANEMOI_CORE_EDITABLE to another mounted checkout path.
+
+The correctness command expects the external O48 dataset under
+/data/correctness/$correctness_dataset.
+EOF
+}
+
+setup_env() {
+  local install_dir=/opt/aifs-raps
+  local venv_dir=/opt/aifs-raps/venv
+
+  export AIFS_INSTALL_DIR="$install_dir"
+  export VIRTUAL_ENV="$venv_dir"
+  export ANEMOI_CONFIG_PATH="$install_dir"
+  export ANEMOI_CONFIG_OVERRIDE_PATH="$install_dir/settings.toml"
+  export HYDRA_FULL_ERROR=1
+  export HOME=/tmp/aifs-raps
+  export MLFLOW_ALLOW_FILE_STORE="${MLFLOW_ALLOW_FILE_STORE:-true}"
+  export PATH="$VIRTUAL_ENV/bin:$AIFS_INSTALL_DIR/bin:$PATH"
+
+  mkdir -p "$HOME"
+
+  if [[ ! -r "$venv_dir/bin/activate" ]]; then
+    echo "Missing virtual environment: $venv_dir" >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC1091
+  source "$venv_dir/bin/activate"
+
+  local anemoi_core_editable="${ANEMOI_CORE_EDITABLE:-/opt/anemoi-core}"
+  if [[ -d "$anemoi_core_editable" ]]; then
+    local src_paths=()
+    local component
+    for component in models training datasets utils; do
+      if [[ -d "$anemoi_core_editable/$component/src" ]]; then
+        src_paths+=("$anemoi_core_editable/$component/src")
+      fi
+    done
+
+    if (( ${#src_paths[@]} == 0 )); then
+      echo "No anemoi-core component src dirs found in $anemoi_core_editable" >&2
+      exit 1
+    fi
+
+    local joined_paths
+    joined_paths=$(IFS=:; echo "${src_paths[*]}")
+    export PYTHONPATH="$joined_paths${PYTHONPATH:+:$PYTHONPATH}"
+  fi
+}
+
+run_rank_command() {
+  local wait_mode=0
+  if [[ "${1:-}" == "--wait" ]]; then
+    wait_mode=1
+    shift
+  fi
+
+  local rundir=$1
+  shift
+
+  export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+  export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,IB,BOOTSTRAP,ENV,NET,GRAPH,TUNING,ALLOC,CALL,NVLS,REG,PROFILE,RAS}"
+  export NCCL_DEBUG_FILE="${NCCL_DEBUG_FILE:-$rundir/logs/nccl.%h.%p}"
+  export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
+  export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+
+  local lrank=${SLURM_LOCALID:-0}
+  local numa_node=$((lrank / 2))
+  local cmd=("$@")
+
+  if [[ "${AIFS_NUMACTL:-1}" == 1 ]]; then
+    cmd=(numactl -N "$numa_node" -m "$numa_node" "${cmd[@]}")
+  fi
+
+  if (( wait_mode )); then
+    "${cmd[@]}"
+  else
+    exec "${cmd[@]}"
+  fi
+}
+
+run_throughput() {
+  setup_env
+  export CLONED_DATASET=1
+
+  local profile=${profile:-0}
+  local extra_args=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --profile)
+        profile=1
+        ;;
+      --no-profile)
+        profile=0
+        ;;
+      --)
+        shift
+        extra_args+=("$@")
+        break
+        ;;
+      *)
+        extra_args+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  batch_limit=${batch_limit:-450}
+  max_epochs=${max_epochs:-2}
+  num_workers=${num_workers:-2}
+  run_prefix=${run_prefix:-direct}
+  local training_mode=train
+  local profile_suffix=""
+  if [[ "$profile" == 1 ]]; then
+    training_mode=profile
+    profile_suffix="_profile"
+  fi
+
+  local dataset="aifs-benchmarking-o800-10years-cloned.zarr"
+  local res=o800
+  local num_channels=1024
+  local hidden_res=7
+  local mapper_chunks=16
+  local proc_chunks=8
+  local train_end_yyyymmdd=20231230
+  local val_start_yyyymmdd=20231231
+  local val_end_yyyymmdd=20231231
+  local global_bs_per_ens=16
+  local ens_size=1
+
+  local nodes=${SLURM_NNODES:?SLURM_NNODES is required}
+  local num_gpus=$((nodes * 4))
+  local num_gpus_per_ens=$((num_gpus / ens_size))
+  local local_bs
+  local num_gpus_per_model
+  if (( num_gpus_per_ens >= global_bs_per_ens )); then
+    local_bs=1
+    num_gpus_per_model=$((num_gpus_per_ens / global_bs_per_ens))
+  else
+    local_bs=$((global_bs_per_ens / num_gpus_per_ens))
+    num_gpus_per_model=1
+  fi
+
+  local num_models=$((num_gpus_per_ens / num_gpus_per_model))
+  local eff_global_bs_per_ens=$((num_models * local_bs))
+  if (( eff_global_bs_per_ens != global_bs_per_ens )); then
+    echo "eff_global_bs_per_ens=$eff_global_bs_per_ens, expected $global_bs_per_ens" >&2
+    exit 1
+  fi
+
+  local output_base="/work/output/train/throughput"
+  local output_root="$output_base/$run_prefix"
+  local graph_dir="/graphs"
+  local graph_file="multi_scale.${res}_0.6CoF_${hidden_res}_3NN_${res}.graph"
+  local run_name="bl${batch_limit}_ep${max_epochs}_ens${ens_size}_nodes${nodes}_gpm${num_gpus_per_model}_bs${local_bs}_nw${num_workers}${profile_suffix}"
+  local rundir="$output_root/${run_name}-${SLURM_JOB_ID}"
+  local anemoi_dir="$rundir/anemoi"
+  local hydra_dir="$rundir/hydra"
+
+  mkdir -p "$graph_dir" "$rundir/logs" "$anemoi_dir" "$hydra_dir"
+
+  local train_cmd=(
+    anemoi-training "$training_mode"
+    --config-name=raps
+    "model.processor.num_chunks=$proc_chunks"
+    "model.encoder.num_chunks=$mapper_chunks"
+    "model.decoder.num_chunks=$mapper_chunks"
+    model=graphtransformer
+    "~model.processor.window_size"
+    "model.num_channels=$num_channels"
+    "hardware.files.dataset=$dataset"
+    "dataloader.training.end=$train_end_yyyymmdd"
+    "dataloader.validation.start=$val_start_yyyymmdd"
+    "dataloader.validation.end=$val_end_yyyymmdd"
+    "dataloader.limit_batches.training=$batch_limit"
+    "hardware.num_gpus_per_model=$num_gpus_per_model"
+    hardware.num_gpus_per_node=4
+    "hardware.num_nodes=$nodes"
+    "hardware.paths.data=/data/throughput"
+    "training.max_epochs=$max_epochs"
+    "dataloader.num_workers.training=$num_workers"
+    "dataloader.num_workers.validation=$num_workers"
+    "hardware.paths.output=$anemoi_dir/"
+    "data.resolution=$res"
+    training.rollout.start=1
+    training.rollout.max=1
+    graph.overwrite=false
+    "hardware.paths.graph=$graph_dir/"
+    "hardware.files.graph=$graph_file"
+    graph=multi_scale
+    "graph.nodes.hidden.node_builder.resolution=$hidden_res"
+    graph.edges.0.edge_builders.0.cutoff_factor=0.6
+    graph.edges.2.edge_builders.0.num_nearest_neighbours=3
+    "graph.edges.1.edge_builders.0.scale_resolutions=$hidden_res"
+    "~graph.nodes.hidden.node_builder.grid"
+    hardware.accelerator=gpu
+    training.precision=bf16-fp32-opt
+    model.layer_kernels.QueryNorm._target_=torch.nn.LayerNorm
+    model.layer_kernels.KeyNorm._target_=torch.nn.LayerNorm
+    diagnostics.log.mlflow.enabled=false
+    "hydra.run.dir=$hydra_dir"
+  )
+
+  if (( local_bs > 1 )); then
+    train_cmd+=(
+      "dataloader.batch_size.training=$local_bs"
+      "dataloader.batch_size.validation=$local_bs"
+    )
+  fi
+
+  train_cmd+=("${extra_args[@]}")
+
+  if [[ "${SLURM_PROCID:-0}" == 0 ]]; then
+    echo "benchmark=throughput"
+    echo "rundir=$rundir"
+    echo "num_gpus=$num_gpus"
+    echo "num_gpus_per_model=$num_gpus_per_model"
+    echo "local_bs=$local_bs"
+    echo "profile=$profile"
+  fi
+
+  run_rank_command "$rundir" "${train_cmd[@]}"
+}
+
+run_correctness_check() {
+  setup_env
+
+  if (( $# == 0 )); then
+    echo "Internal error: correctness check requires at least one run directory" >&2
+    exit 2
+  fi
+
+  python - "$@" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+
+def first_matching_child(path: Path, skip_meta: bool = False) -> Path | None:
+    try:
+        children = sorted(path.iterdir())
+    except FileNotFoundError:
+        return None
+
+    for child in children:
+        if skip_meta and child.name == "meta.yaml":
+            continue
+        if re.match(r"^\w+", child.name):
+            return child
+    return None
+
+
+def latest_loss(metrics_path: Path) -> tuple[float | None, str | None]:
+    try:
+        lines = metrics_path.read_text().splitlines()
+    except FileNotFoundError:
+        return None, None
+
+    for line in reversed(lines):
+        parts = line.split()
+        if len(parts) >= 3:
+            return float(parts[1]), parts[2]
+    return None, None
+
+
+losses: list[float] = []
+for rundir_arg in sys.argv[1:]:
+    rundir = Path(rundir_arg)
+    mlflow_dir = rundir / "train-outputs" / "logs" / "mlflow"
+    experiment_dir = first_matching_child(mlflow_dir)
+    if experiment_dir is None:
+        print(f"Can't find MLflow experiment for run '{rundir.name}'")
+        continue
+
+    run_dir = first_matching_child(experiment_dir, skip_meta=True)
+    if run_dir is None:
+        print(f"Can't find MLflow run for run '{rundir.name}'")
+        continue
+
+    metrics_path = run_dir / "metrics" / "train_mse_loss_step"
+    loss, step = latest_loss(metrics_path)
+    if loss is None:
+        print(f"Can't find train loss metric for run '{rundir.name}'")
+        continue
+
+    print(f"{rundir.name}: train_mse_loss_step={loss:.6f} step={step}")
+    losses.append(loss)
+
+if not losses:
+    print("No valid loss values found.")
+    sys.exit(1)
+
+mean_loss = sum(losses) / len(losses)
+score_to_pass = 0.007
+print(f"mean loss of {mean_loss:.4f} versus {score_to_pass} reference (lower is better)")
+if mean_loss <= score_to_pass:
+    print("PASS")
+    sys.exit(0)
+
+print("FAIL")
+sys.exit(1)
+PY
+}
+
+run_correctness() {
+  setup_env
+
+  local extra_args=("$@")
+  batch_limit=${batch_limit:-1000}
+  correctness_batch_limit=${correctness_batch_limit:-100}
+  max_epochs=${max_epochs:-5}
+  num_workers=${num_workers:-8}
+  run_prefix=${run_prefix:-direct}
+  correctness_dataset=${correctness_dataset:-aifs-ea-an-oper-0001-mars-o48-1979-2022-6h-v6.zarr}
+
+  local data_dir=/data/correctness
+  local dataset_path="$data_dir/$correctness_dataset"
+  if [[ ! -d "$dataset_path" ]]; then
+    echo "Missing correctness dataset: $dataset_path" >&2
+    echo "Mount the dataset parent at /data/correctness, or set correctness_dataset to the mounted .zarr name." >&2
+    exit 1
+  fi
+
+  local dataset="$correctness_dataset"
+  local res=o48
+  local num_channels=256
+  local hidden_res=o32
+  local mapper_chunks=4
+  local proc_chunks=8
+  local train_end_yyyymmdd=2020
+  local val_start_yyyymmdd=2021
+  local val_end_yyyymmdd=2021
+  local local_bs=4
+  local num_gpus_per_model=1
+
+  local nodes=${SLURM_NNODES:?SLURM_NNODES is required}
+  local num_gpus=$((nodes * 4))
+  if (( num_gpus != 4 )); then
+    echo "The correctness benchmark must run with exactly 4 GPUs; got $num_gpus from SLURM_NNODES=$nodes" >&2
+    exit 1
+  fi
+
+  export ANEMOI_BASE_SEED=42
+
+  local output_base="/work/output/train/correctness"
+  local output_root="$output_base/$run_prefix"
+  local graph_dir="/graphs"
+  local graph_file="encoder_decoder_only.${res}_0.6CoF_${hidden_res}_3NN_${res}.graph"
+  local run_name="bl${batch_limit}_vbl${correctness_batch_limit}_ep${max_epochs}_nodes${nodes}_gpm${num_gpus_per_model}_bs${local_bs}_nw${num_workers}"
+  local rundir="$output_root/${run_name}-${SLURM_JOB_ID}"
+  local hydra_dir="$rundir/outputs"
+
+  mkdir -p "$graph_dir" "$rundir/logs" "$rundir/train-outputs" "$hydra_dir"
+
+  local train_cmd=(
+    anemoi-training train
+    --config-name=raps
+    "model.processor.num_chunks=$proc_chunks"
+    "model.encoder.num_chunks=$mapper_chunks"
+    "model.decoder.num_chunks=$mapper_chunks"
+    model=transformer
+    model.processor.window_size=256
+    "model.num_channels=$num_channels"
+    "hardware.files.dataset=$dataset"
+    "dataloader.training.end=$train_end_yyyymmdd"
+    "dataloader.validation.start=$val_start_yyyymmdd"
+    "dataloader.validation.end=$val_end_yyyymmdd"
+    "dataloader.limit_batches.training=$batch_limit"
+    "dataloader.limit_batches.validation=$correctness_batch_limit"
+    "hardware.num_gpus_per_model=$num_gpus_per_model"
+    hardware.num_gpus_per_node=4
+    "hardware.num_nodes=$nodes"
+    "hardware.paths.data=$data_dir"
+    "training.max_epochs=$max_epochs"
+    training.max_steps=30000
+    training.lr.rate=1e-3
+    training.lr.iterations=30000
+    training.lr.min=3e-7
+    "dataloader.num_workers.training=$num_workers"
+    "dataloader.num_workers.validation=$num_workers"
+    "dataloader.batch_size.training=$local_bs"
+    "dataloader.batch_size.validation=$local_bs"
+    "hardware.paths.output=$rundir/train-outputs/"
+    "data.resolution=$res"
+    training.rollout.start=1
+    training.rollout.max=1
+    graph.overwrite=false
+    "hardware.paths.graph=$graph_dir/"
+    "hardware.files.graph=$graph_file"
+    graph=encoder_decoder_only
+    "graph.nodes.hidden.node_builder.grid=$hidden_res"
+    graph.edges.0.edge_builders.0.cutoff_factor=0.6
+    graph.edges.1.edge_builders.0.num_nearest_neighbours=3
+    hardware.accelerator=gpu
+    training.precision=bf16-fp32-opt
+    model.layer_kernels.QueryNorm._target_=torch.nn.LayerNorm
+    model.layer_kernels.KeyNorm._target_=torch.nn.LayerNorm
+    diagnostics.log.mlflow.enabled=true
+    diagnostics.log.mlflow.offline=true
+    "hydra.run.dir=$hydra_dir"
+  )
+
+  train_cmd+=("${extra_args[@]}")
+
+  if [[ "${SLURM_PROCID:-0}" == 0 ]]; then
+    echo "benchmark=correctness"
+    echo "rundir=$rundir"
+    echo "dataset=$dataset_path"
+    echo "num_gpus=$num_gpus"
+    echo "num_gpus_per_model=$num_gpus_per_model"
+    echo "local_bs=$local_bs"
+  fi
+
+  set +e
+  run_rank_command --wait "$rundir" "${train_cmd[@]}"
+  local train_status=$?
+  set -e
+  if (( train_status != 0 )); then
+    exit "$train_status"
+  fi
+
+  if [[ "${SLURM_PROCID:-0}" == 0 ]]; then
+    run_correctness_check "$rundir"
+  fi
+}
+
+run_highres() {
+  setup_env
+  export CLONED_DATASET=1
+
+  local extra_args=("$@")
+  ens_size=${ens_size:-4}
+  batch_limit=${batch_limit:-90}
+  max_epochs=${max_epochs:-2}
+  num_workers=${num_workers:-2}
+  run_prefix=${run_prefix:-direct}
+  local_bs=${local_bs:-1}
+  generate_graph=${generate_graph:-0}
+
+  local dataset="aifs-benchmark-4km-2years-synthetic.zarr"
+  local res=o2560
+  local num_channels=2048
+  local hidden_res=o256
+  local mapper_chunks=32
+  local proc_chunks=8
+  local train_end_yyyymmdd=20230929
+  local val_start_yyyymmdd=20230930
+  local val_end_yyyymmdd=20230930
+  local global_bs_per_ens=16
+
+  local nodes=${SLURM_NNODES:?SLURM_NNODES is required}
+  local num_gpus=$((nodes * 4))
+  if [[ "$generate_graph" == 1 ]]; then
+    ens_size=1
+  fi
+
+  local num_gpus_per_ens=$((num_gpus / ens_size))
+  local num_gpus_per_model
+  if [[ "$generate_graph" == 1 ]]; then
+    local_bs=1
+    num_gpus_per_model=$num_gpus
+  elif (( num_gpus_per_ens >= global_bs_per_ens / local_bs )); then
+    num_gpus_per_model=$((num_gpus_per_ens / (global_bs_per_ens / local_bs)))
+  else
+    echo "Not enough GPUs" >&2
+    exit 1
+  fi
+
+  local num_models=$((num_gpus_per_ens / num_gpus_per_model))
+  local eff_global_bs_per_ens=$((num_models * local_bs))
+  if [[ "$generate_graph" != 1 ]] && (( eff_global_bs_per_ens != global_bs_per_ens )); then
+    echo "eff_global_bs_per_ens=$eff_global_bs_per_ens, expected $global_bs_per_ens" >&2
+    exit 1
+  fi
+
+  local output_base="/work/output/train/highres"
+  local output_root="$output_base/$run_prefix"
+  local graph_dir="/graphs"
+  local graph_file="encoder_decoder_only.${res}_0.6CoF_${hidden_res}_3NN_${res}.graph"
+  local run_name="bl${batch_limit}_ep${max_epochs}_ens${ens_size}_nodes${nodes}_gpm${num_gpus_per_model}_bs${local_bs}_nw${num_workers}"
+  local rundir="$output_root/${run_name}-${SLURM_JOB_ID}"
+  local anemoi_dir="$rundir/anemoi"
+  local hydra_dir="$rundir/hydra"
+
+  mkdir -p "$graph_dir" "$rundir/logs" "$anemoi_dir" "$hydra_dir"
+
+  local train_cmd=(
+    anemoi-training train
+    --config-name=raps
+    "model.processor.num_chunks=$proc_chunks"
+    "model.encoder.num_chunks=$mapper_chunks"
+    "model.decoder.num_chunks=$mapper_chunks"
+    model.processor.window_size=2160
+    "model.num_channels=$num_channels"
+    "hardware.files.dataset=$dataset"
+    "dataloader.training.end=$train_end_yyyymmdd"
+    "dataloader.validation.start=$val_start_yyyymmdd"
+    "dataloader.validation.end=$val_end_yyyymmdd"
+    "dataloader.limit_batches.training=$batch_limit"
+    "hardware.num_gpus_per_model=$num_gpus_per_model"
+    hardware.num_gpus_per_node=4
+    "hardware.num_nodes=$nodes"
+    "hardware.paths.data=/data/high-res"
+    "training.max_epochs=$max_epochs"
+  )
+
+  if (( ens_size > 1 )); then
+    local num_gpus_per_ensemble=$((ens_size * num_gpus_per_model))
+    train_cmd+=(
+      training=less_memory_loss_ensemble
+      datamodule=ens
+      model=transformer_ens
+      hardware.files.truncation=null
+      hardware.files.truncation_inv=null
+      "+hardware.num_gpus_per_ensemble=$num_gpus_per_ensemble"
+      training.ensemble_size_per_device=1
+    )
+  fi
+
+  train_cmd+=(
+    "dataloader.num_workers.training=$num_workers"
+    "dataloader.num_workers.validation=$num_workers"
+    "hardware.paths.output=$anemoi_dir/"
+    "data.resolution=$res"
+    training.rollout.start=1
+    training.rollout.max=1
+    graph.overwrite=false
+    "hardware.paths.graph=$graph_dir/"
+    "hardware.files.graph=$graph_file"
+    graph=encoder_decoder_only
+    "graph.nodes.hidden.node_builder.grid=$hidden_res"
+    graph.edges.0.edge_builders.0.cutoff_factor=0.6
+    graph.edges.1.edge_builders.0.num_nearest_neighbours=3
+    hardware.accelerator=gpu
+    training.precision=bf16-fp32-opt
+    model.layer_kernels.QueryNorm._target_=torch.nn.LayerNorm
+    model.layer_kernels.KeyNorm._target_=torch.nn.LayerNorm
+    "model.compile=[{module:anemoi.models.layers.conv.GraphTransformerConv}]"
+    diagnostics.log.mlflow.enabled=false
+    data=zarr_no_insolation
+    "hydra.run.dir=$hydra_dir"
+  )
+
+  if (( local_bs > 1 )); then
+    train_cmd+=(
+      "dataloader.batch_size.training=$local_bs"
+      "dataloader.batch_size.validation=$local_bs"
+    )
+  fi
+
+  train_cmd+=("${extra_args[@]}")
+
+  if [[ "${SLURM_PROCID:-0}" == 0 ]]; then
+    echo "benchmark=highres"
+    echo "rundir=$rundir"
+    echo "num_gpus=$num_gpus"
+    echo "num_gpus_per_model=$num_gpus_per_model"
+    echo "local_bs=$local_bs"
+    echo "ens_size=$ens_size"
+  fi
+
+  run_rank_command "$rundir" "${train_cmd[@]}"
+}
+
+cmd=${1:-help}
+if (( $# > 0 )); then
+  shift
+fi
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    ;;
+  smoke)
+    setup_env
+    anemoi-training --help >/dev/null
+    echo "aifs-benchmark smoke test complete"
+    ;;
+  throughput)
+    run_throughput "$@"
+    ;;
+  throughput-generate-graph)
+    batch_limit=${batch_limit:-1}
+    max_epochs=${max_epochs:-1}
+    run_prefix=${run_prefix:-generate-graph}
+    run_throughput "$@"
+    ;;
+  highres|high-res)
+    run_highres "$@"
+    ;;
+  highres-generate-graph|high-res-generate-graph)
+    batch_limit=${batch_limit:-1}
+    max_epochs=${max_epochs:-1}
+    generate_graph=1
+    run_prefix=${run_prefix:-generate-graph}
+    run_highres "$@"
+    ;;
+  correctness)
+    run_correctness "$@"
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
