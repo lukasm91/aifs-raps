@@ -1,0 +1,31 @@
+{
+  "slurm": [
+    "-A your-account",
+    "-p gpu"
+  ],
+  "container": "/path/to/containers/aifs-benchmark.sqsh",
+  "cpus_per_task": 144,
+  "torchrun": {
+    "numa_nodes": 2,
+    "gpus_per_numa_node": 2
+  },
+  "data": {
+    "throughput": "/path/to/data/aifs-benchmarking-o800-10years-cloned.zarr",
+    "highres": "/path/to/data/aifs-benchmark-4km-2years-synthetic.zarr",
+    "correctness": "/path/to/data/aifs-ea-an-oper-0001-mars-o48-1979-2022-6h-v6.zarr"
+  },
+  "inference": {
+    "input": "/path/to/data/aifs-rd-an-lwda-ifc3-mars-o2560-2023-2023-6h-v3-1week.zarr",
+    "checkpoint": "/path/to/checkpoints/inference-last.ckpt"
+  },
+  "dataset_expansion": {
+    "throughput": {
+      "source": "/path/to/data/aifs-benchmarking-ea-an-oper-0001-mars-o800-2023-2023-6h-v1.zarr",
+      "destination": "/path/to/data/aifs-benchmarking-o800-10years-cloned.zarr"
+    },
+    "highres": {
+      "source": "/path/to/data/aifs-rd-an-lwda-ifc3-mars-o2560-2023-2023-6h-v3-1week.zarr",
+      "destination": "/path/to/data/aifs-benchmark-4km-2years-synthetic.zarr"
+    }
+  }
+}

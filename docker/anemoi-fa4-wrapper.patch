@@ -1,0 +1,71 @@
+--- attention.py
++++ attention.py
+@@ -146,6 +146,7 @@
+         attn_funcs = {
+             "flash_attention": FlashAttentionWrapper,
+             "flash_attention_v3": FlashAttentionV3Wrapper,
++            "flash_attention_v4": FlashAttentionV4Wrapper,
+             "flex_attention": FlexAttentionWrapper,
+             "scaled_dot_product_attention": SDPAAttentionWrapper,
+         }
+@@ -581,3 +582,60 @@
+         alibi_slopes_hat = torch.pow(slope_hat_0, torch.arange(1, 1 + 2 * (num_heads - n), 2))
+         alibi_slopes = torch.cat([alibi_slopes, alibi_slopes_hat])
+     return alibi_slopes
++
++
++class FlashAttentionV4Wrapper(nn.Module):
++    """Wrapper for Flash Attention v4 (CuTe DSL implementation)."""
++
++    def __init__(self):
++        super().__init__()
++        try:
++            from flash_attn.cute import flash_attn_func
++        except ImportError as e:
++            raise ImportError(
++                "Flash Attention v4 (CuTe DSL) not installed. "
++                "Requires flash-attention with CuTe support and nvidia-cutlass-dsl. "
++                f"Original error: {e}"
++            )
++
++        self.attention = flash_attn_func
++        self.deterministic = torch.are_deterministic_algorithms_enabled()
++        LOGGER.info("Using flash attention v4 (CuTe DSL), deterministic=%s", self.deterministic)
++
++    def forward(
++        self,
++        query,
++        key,
++        value,
++        batch_size: int,
++        causal: bool = False,
++        window_size: int = None,
++        dropout_p: float = 0.0,
++        softcap=None,
++        alibi_slopes: torch.Tensor = None,
++    ):
++        query, key, value = (
++            einops.rearrange(t, "batch heads grid vars -> batch grid heads vars") for t in (query, key, value)
++        )
++
++        if dropout_p != 0.0:
++            LOGGER.warning("Flash Attention v4 does not support dropout; ignoring dropout_p=%.2f", dropout_p)
++
++        if alibi_slopes is not None:
++            raise NotImplementedError(
++                "ALiBi slopes are not supported by Flash Attention v4. "
++                "Please switch to flash_attention (v2) or disable alibi slopes."
++            )
++
++        ws = (window_size, window_size) if window_size is not None else (None, None)
++        out = self.attention(
++            query,
++            key,
++            value,
++            causal=causal,
++            window_size=ws,
++            softcap=softcap if softcap is not None else 0.0,
++            deterministic=self.deterministic,
++        )[0]
++
++        return einops.rearrange(out, "batch grid heads vars -> batch heads grid vars")

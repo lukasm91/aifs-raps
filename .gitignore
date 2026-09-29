@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+logs/
+output/
+graphs/
+.aifs-job-scripts/
+*.sqsh
+generated/jobs/
+generated/configs/
+generated/manifest.tsv
+generated/dataset-expansion/
+clusters/site.json

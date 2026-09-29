@@ -1,0 +1,11 @@
+.agents
+.codex
+.git
+*.swp
+build
+data
+logs
+output
+*.log
+*.out
+*.sqsh
